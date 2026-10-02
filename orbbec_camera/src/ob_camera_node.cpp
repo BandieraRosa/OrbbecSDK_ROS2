@@ -576,6 +576,7 @@ void OBCameraNode::getParameters() {
   setAndGetNodeParameter(enable_point_cloud_, "enable_point_cloud", true);
   setAndGetNodeParameter<std::string>(ir_info_url_, "ir_info_url", "");
   setAndGetNodeParameter<std::string>(color_info_url_, "color_info_url", "");
+  setupIrInfoManager();
   setAndGetNodeParameter(enable_colored_point_cloud_, "enable_colored_point_cloud", false);
   setAndGetNodeParameter(enable_point_cloud_, "enable_point_cloud", true);
   setAndGetNodeParameter<std::string>(point_cloud_qos_, "point_cloud_qos", "default");
@@ -770,6 +771,181 @@ void OBCameraNode::publishPointCloud(const std::shared_ptr<ob::FrameSet> &frame_
   }
 }
 
+void OBCameraNode::setupIrInfoManager() {
+  if (ir_info_url_.empty()) {
+    return;
+  }
+  ir_info_manager_ =
+      std::make_unique<camera_info_manager::CameraInfoManager>(node_, camera_name_ + "_ir");
+  if (!ir_info_manager_->loadCameraInfo(ir_info_url_) || !ir_info_manager_->isCalibrated()) {
+    RCLCPP_WARN_STREAM(logger_, "Failed to load calibrated IR info from '"
+                                    << ir_info_url_ << "', fallback to built-in values");
+    ir_info_manager_.reset();
+  } else {
+    RCLCPP_INFO_STREAM(logger_, "Loaded calibrated IR info from '" << ir_info_url_ << "'");
+  }
+}
+
+bool OBCameraNode::applyCalibratedCameraInfo(const sensor_msgs::msg::CameraInfo &info) {
+  if (info.k.size() < 9 || info.width == 0 || info.height == 0) {
+    RCLCPP_WARN(logger_, "Calibrated IR info has bad K/size, fallback to built-in values");
+    return false;
+  }
+  // CameraInfo d ordering (plumb_bob and rational_polynomial share the prefix):
+  // k1, k2, p1, p2, k3[, k4, k5, k6]
+  float k4 = 0.0f, k5 = 0.0f, k6 = 0.0f;
+  float k1, k2, p1, p2, k3;
+  if (info.d.size() >= 8) {
+    k1 = static_cast<float>(info.d[0]);
+    k2 = static_cast<float>(info.d[1]);
+    p1 = static_cast<float>(info.d[2]);
+    p2 = static_cast<float>(info.d[3]);
+    k3 = static_cast<float>(info.d[4]);
+    k4 = static_cast<float>(info.d[5]);
+    k5 = static_cast<float>(info.d[6]);
+    k6 = static_cast<float>(info.d[7]);
+  } else if (info.d.size() >= 5) {
+    k1 = static_cast<float>(info.d[0]);
+    k2 = static_cast<float>(info.d[1]);
+    p1 = static_cast<float>(info.d[2]);
+    p2 = static_cast<float>(info.d[3]);
+    k3 = static_cast<float>(info.d[4]);
+  } else {
+    RCLCPP_WARN(logger_, "Calibrated IR info has bad distortion size, fallback to built-in values");
+    return false;
+  }
+  const float fx = static_cast<float>(info.k[0]);
+  const float fy = static_cast<float>(info.k[4]);
+  const float cx = static_cast<float>(info.k[2]);
+  const float cy = static_cast<float>(info.k[5]);
+  const auto width = static_cast<int16_t>(info.width);
+  const auto height = static_cast<int16_t>(info.height);
+
+  //
+  // 1. OBCameraParam:
+  //    used by CameraInfo and other wrapper code
+  //
+  if (camera_param_) {
+    auto &intrinsic = camera_param_->depthIntrinsic;
+    intrinsic.fx = fx;
+    intrinsic.fy = fy;
+    intrinsic.cx = cx;
+    intrinsic.cy = cy;
+    intrinsic.width = width;
+    intrinsic.height = height;
+
+    auto &dist = camera_param_->depthDistortion;
+    dist.k1 = k1;
+    dist.k2 = k2;
+    dist.k3 = k3;
+    dist.k4 = k4;
+    dist.k5 = k5;
+    dist.k6 = k6;
+    dist.p1 = p1;
+    dist.p2 = p2;
+  }
+
+  //
+  // 2. OBCalibrationParam:
+  //    THIS is what Orbbec SDK's XY table / point cloud uses.
+  //
+  if (calibration_param_) {
+    auto &intrinsic = calibration_param_->intrinsics[OB_SENSOR_DEPTH];
+    intrinsic.fx = fx;
+    intrinsic.fy = fy;
+    intrinsic.cx = cx;
+    intrinsic.cy = cy;
+    intrinsic.width = width;
+    intrinsic.height = height;
+
+    auto &dist = calibration_param_->distortion[OB_SENSOR_DEPTH];
+    dist.k1 = k1;
+    dist.k2 = k2;
+    dist.k3 = k3;
+    dist.k4 = k4;
+    dist.k5 = k5;
+    dist.k6 = k6;
+    dist.p1 = p1;
+    dist.p2 = p2;
+  }
+  return true;
+}
+
+void OBCameraNode::overrideAstraProDepthCalibration() {
+  // Preferred chain: astra_pro_ir.yaml -> ir_info_url -> CameraInfoManager.
+  if (ir_info_manager_ && ir_info_manager_->isCalibrated()) {
+    if (applyCalibratedCameraInfo(ir_info_manager_->getCameraInfo())) {
+      return;
+    }
+  }
+
+  // Fallback: built-in measured Astra Pro values.
+  constexpr float fx = 585.414401f;
+  constexpr float fy = 586.844077f;
+  constexpr float cx = 332.370276f;
+  constexpr float cy = 237.511484f;
+
+  constexpr float k1 = -0.0881992504f;
+  constexpr float k2 = 0.1377045996f;
+  constexpr float p1 = -0.0017015349f;
+  constexpr float p2 = 0.0074412899f;
+  constexpr float k3 = 0.0f;
+
+  //
+  // 1. OBCameraParam:
+  //    used by CameraInfo and other wrapper code
+  //
+  if (camera_param_) {
+    auto &intrinsic = camera_param_->depthIntrinsic;
+
+    intrinsic.fx = fx;
+    intrinsic.fy = fy;
+    intrinsic.cx = cx;
+    intrinsic.cy = cy;
+    intrinsic.width = 640;
+    intrinsic.height = 480;
+
+    auto &dist = camera_param_->depthDistortion;
+
+    dist.k1 = k1;
+    dist.k2 = k2;
+    dist.k3 = k3;
+    dist.k4 = 0.0f;
+    dist.k5 = 0.0f;
+    dist.k6 = 0.0f;
+
+    dist.p1 = p1;
+    dist.p2 = p2;
+  }
+
+  //
+  // 2. OBCalibrationParam:
+  //    THIS is what Orbbec SDK's XY table / point cloud uses.
+  //
+  if (calibration_param_) {
+    auto &intrinsic = calibration_param_->intrinsics[OB_SENSOR_DEPTH];
+
+    intrinsic.fx = fx;
+    intrinsic.fy = fy;
+    intrinsic.cx = cx;
+    intrinsic.cy = cy;
+    intrinsic.width = 640;
+    intrinsic.height = 480;
+
+    auto &dist = calibration_param_->distortion[OB_SENSOR_DEPTH];
+
+    dist.k1 = k1;
+    dist.k2 = k2;
+    dist.k3 = k3;
+    dist.k4 = 0.0f;
+    dist.k5 = 0.0f;
+    dist.k6 = 0.0f;
+
+    dist.p1 = p1;
+    dist.p2 = p2;
+  }
+}
+
 void OBCameraNode::publishDepthPointCloud(const std::shared_ptr<ob::FrameSet> &frame_set) {
   if (!enable_point_cloud_ || !depth_cloud_pub_ ||
       depth_cloud_pub_->get_subscription_count() == 0) {
@@ -792,13 +968,16 @@ void OBCameraNode::publishDepthPointCloud(const std::shared_ptr<ob::FrameSet> &f
   if (!xy_tables_.has_value()) {
     calibration_param_ = pipeline_->getCalibrationParam(pipeline_config_);
 
-    uint32_t tableSize = width * height * 2; // one for x-coordinate and one for y-coordinate LUT
+    // Replace broken Astra Pro SDK calibration
+    // with our measured calibration.
+    overrideAstraProDepthCalibration();
+
+    uint32_t tableSize = width * height * 2;  // one for x-coordinate and one for y-coordinate LUT
     xy_table_data_ = new float[tableSize];
 
     xy_tables_ = OBXYTables();
     if (!ob::CoordinateTransformHelper::transformationInitXYTables(
-        *calibration_param_, OB_SENSOR_DEPTH, *xy_table_data_,
-        &tableSize, &(*xy_tables_))) {
+            *calibration_param_, OB_SENSOR_DEPTH, *xy_table_data_, &tableSize, &(*xy_tables_))) {
       xy_tables_.reset();
       RCLCPP_ERROR_STREAM(logger_, "Failed to init xy tables");
       return;
@@ -811,14 +990,12 @@ void OBCameraNode::publishDepthPointCloud(const std::shared_ptr<ob::FrameSet> &f
   }
 
   uint32_t pointcloudSize = width * height * sizeof(OBPoint3f);
-  uint8_t * pointcloudData = new uint8_t[pointcloudSize];
+  uint8_t *pointcloudData = new uint8_t[pointcloudSize];
   memset(pointcloudData, 0, pointcloudSize);
-  OBPoint * pointPixel = (OBPoint *)pointcloudData;
+  OBPoint *pointPixel = (OBPoint *)pointcloudData;
 
-  ob::CoordinateTransformHelper::transformationDepthToPointCloud(
-    &(*xy_tables_),
-    depth_data,
-    pointPixel);
+  ob::CoordinateTransformHelper::transformationDepthToPointCloud(&(*xy_tables_), depth_data,
+                                                                 pointPixel);
 
   sensor_msgs::PointCloud2Modifier modifier(point_cloud_msg_);
   modifier.setPointCloud2FieldsByString(1, "xyz");
@@ -836,7 +1013,7 @@ void OBCameraNode::publishDepthPointCloud(const std::shared_ptr<ob::FrameSet> &f
   const static float MAX_DISTANCE = 10000.0;
   for (uint32_t i = 0; i < width * height; i++) {
     bool valid_point = true;
-    if (pointPixel[i].z<MIN_DISTANCE || pointPixel[i].z> MAX_DISTANCE) {
+    if (pointPixel[i].z < MIN_DISTANCE || pointPixel[i].z > MAX_DISTANCE) {
       valid_point = false;
     }
     if (valid_point || ordered_pc_) {
@@ -1207,6 +1384,7 @@ void OBCameraNode::onNewFrameCallback(const std::shared_ptr<ob::Frame> &frame,
   if (!camera_param_) {
     camera_param_ = pipeline_->getCameraParam();
   }
+  overrideAstraProDepthCalibration();
   auto &intrinsic =
       stream_index == COLOR ? camera_param_->rgbIntrinsic : camera_param_->depthIntrinsic;
   auto &distortion =

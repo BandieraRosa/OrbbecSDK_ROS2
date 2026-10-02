@@ -194,6 +194,12 @@ class OBCameraNode {
 
   std::optional<OBCameraParam> getColorCameraParam();
 
+  void overrideAstraProDepthCalibration();
+
+  void setupIrInfoManager();
+
+  bool applyCalibratedCameraInfo(const sensor_msgs::msg::CameraInfo& info);
+
   void getExposureCallback(const std::shared_ptr<GetInt32::Request>& request,
                            std::shared_ptr<GetInt32::Response>& response,
                            const stream_index_pair& stream_index);
@@ -406,7 +412,7 @@ class OBCameraNode {
   std::optional<OBCameraParam> camera_param_;
   std::optional<OBCalibrationParam> calibration_param_;
   std::optional<OBXYTables> xy_tables_;
-  std::optional<float *> xy_table_data_;
+  std::optional<float*> xy_table_data_;
   bool enable_d2c_viewer_ = false;
   std::unique_ptr<D2CViewer> d2c_viewer_ = nullptr;
   std::map<stream_index_pair, std::atomic_bool> save_images_;
